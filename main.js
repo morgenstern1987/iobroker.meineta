@@ -8,14 +8,19 @@ const { buildObjectPath } = require("./lib/nameMapper");
 class MeinEta extends utils.Adapter {
 
     constructor(options) {
+
         super({
             ...options,
             name: "meineta"
         });
 
         this.uriMap = {};
+        this.pollTimer = null;
+        this.stopping = false;
 
         this.on("ready", this.onReady.bind(this));
+        this.on("unload", this.onUnload.bind(this));
+
     }
 
     async onReady() {
@@ -23,13 +28,15 @@ class MeinEta extends utils.Adapter {
         try {
 
             if (!this.config.host) {
+
                 this.log.error("Bitte ETA IP konfigurieren");
                 return;
+
             }
 
             this.client = new EtaClient(this.config.host, this.config.port);
 
-            await this.resetAdapterObjects();
+            await this.cleanupObjects();
 
             await this.ensureVarSet();
 
@@ -37,18 +44,12 @@ class MeinEta extends utils.Adapter {
 
             this.log.info("Discovery abgeschlossen");
 
-            setTimeout(() => {
-
+            this.pollTimer = setInterval(() => {
                 this.pollVars();
+                this.pollErrors();
+            }, this.config.pollInterval);
 
-                this.pollTimer = setInterval(() => {
-
-                    this.pollVars();
-                    this.pollErrors();
-
-                }, this.config.pollInterval);
-
-            }, 3000);
+            await this.pollVars();
 
         } catch (error) {
 
@@ -58,15 +59,33 @@ class MeinEta extends utils.Adapter {
 
     }
 
-    async resetAdapterObjects() {
+    async onUnload(callback) {
+
+        try {
+
+            this.stopping = true;
+
+            if (this.pollTimer) clearInterval(this.pollTimer);
+
+            callback();
+
+        } catch {
+            callback();
+        }
+
+    }
+
+    async cleanupObjects() {
 
         const objects = await this.getAdapterObjectsAsync();
 
         for (const id in objects) {
 
-            if (id.startsWith(this.namespace + ".")) {
+            const obj = objects[id];
 
-                this.log.debug(`Lösche altes Objekt ${id}`);
+            if (obj.type === "state" && !obj.common?.type) {
+
+                this.log.warn(`Entferne falsches Objekt ${id}`);
 
                 await this.delObjectAsync(id);
 
@@ -79,9 +98,13 @@ class MeinEta extends utils.Adapter {
     async ensureVarSet() {
 
         try {
+
             await this.client.put(`/user/vars/${this.config.varset}`);
+
         } catch {
+
             this.log.debug("VarSet existiert bereits");
+
         }
 
     }
@@ -109,7 +132,9 @@ class MeinEta extends utils.Adapter {
             const uri = v.uri.replace(/^\//, "");
 
             try {
+
                 await this.client.put(`/user/vars/${this.config.varset}/${uri}`);
+
             } catch {}
 
         }
@@ -140,6 +165,7 @@ class MeinEta extends utils.Adapter {
                 });
 
                 continue;
+
             }
 
             if (!last) {
@@ -151,6 +177,7 @@ class MeinEta extends utils.Adapter {
                 });
 
                 continue;
+
             }
 
             await this.setObjectAsync(path, {
@@ -171,6 +198,8 @@ class MeinEta extends utils.Adapter {
 
     async pollVars() {
 
+        if (this.stopping) return;
+
         try {
 
             const data = await this.client.get(`/user/vars/${this.config.varset}`);
@@ -180,6 +209,8 @@ class MeinEta extends utils.Adapter {
             if (!vars) return;
 
             for (const v of vars) {
+
+                if (this.stopping) return;
 
                 const uri = v.$.uri;
 
@@ -201,6 +232,7 @@ class MeinEta extends utils.Adapter {
                 if (unit && obj.common.unit !== unit) {
 
                     obj.common.unit = unit;
+
                     await this.setObjectAsync(id, obj);
 
                 }
@@ -211,13 +243,19 @@ class MeinEta extends utils.Adapter {
 
         } catch (error) {
 
-            this.log.error(`Polling Fehler: ${error}`);
+            if (!this.stopping) {
+
+                this.log.error(`Polling Fehler: ${error}`);
+
+            }
 
         }
 
     }
 
     async pollErrors() {
+
+        if (this.stopping) return;
 
         try {
 
@@ -241,7 +279,11 @@ class MeinEta extends utils.Adapter {
 
         } catch (error) {
 
-            this.log.error(`Fehler beim Lesen der Fehlerliste: ${error}`);
+            if (!this.stopping) {
+
+                this.log.error(`Error Polling Fehler: ${error}`);
+
+            }
 
         }
 
