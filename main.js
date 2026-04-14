@@ -4,12 +4,12 @@ const utils = require("@iobroker/adapter-core");
 const EtaClient = require("./lib/etaClient");
 const { flattenMenu } = require("./lib/parser");
 
-class EtaTouch extends utils.Adapter {
+class MeinEta extends utils.Adapter {
 
     constructor(options) {
         super({
             ...options,
-            name: "eta-touch"
+            name: "meineta"
         });
 
         this.on("ready", this.onReady.bind(this));
@@ -18,103 +18,136 @@ class EtaTouch extends utils.Adapter {
 
     async onReady() {
 
-        this.client = new EtaClient(this.config.host, this.config.port);
+        try {
 
-        await this.createVarSet();
-        await this.discoverMenu();
+            if (!this.config.host) {
+                this.log.error("Keine ETA IP konfiguriert");
+                return;
+            }
 
-        this.pollTimer = setInterval(() => {
-            this.pollVars();
-            this.pollErrors();
-        }, this.config.pollInterval);
+            this.client = new EtaClient(this.config.host, this.config.port);
+
+            await this.createVarSet();
+            await this.discoverMenu();
+
+            this.subscribeStates("values.*");
+
+            this.pollTimer = setInterval(() => {
+                this.pollVars();
+                this.pollErrors();
+            }, this.config.pollInterval || 60000);
+
+        } catch (error) {
+            this.log.error(error);
+        }
+
     }
 
     async createVarSet() {
 
         try {
             await this.client.put(`/user/vars/${this.config.varset}`);
-        } catch {
-            this.log.debug("Varset exists");
+        } catch (error) {
+            this.log.debug("Varset existiert bereits");
         }
 
     }
 
     async discoverMenu() {
 
-        const data = await this.client.get("/user/menu");
+        try {
 
-        const menu = data.eta.menu[0];
+            const data = await this.client.get("/user/menu");
 
-        const vars = flattenMenu(menu);
+            const menu = data.eta.menu[0];
 
-        for (const v of vars) {
+            const vars = flattenMenu(menu);
 
-            const addr = v.uri.replace(/\//g, "_");
+            for (const v of vars) {
 
-            await this.setObjectNotExistsAsync(`values.${addr}`, {
-                type: "state",
-                common: {
-                    name: v.name,
-                    type: "number",
-                    role: "value",
-                    read: true,
-                    write: true
-                },
-                native: {
-                    uri: v.uri
-                }
-            });
+                const addr = v.uri.replace(/\//g, "_");
 
-            const uri = v.uri.replace("/","");
+                await this.setObjectNotExistsAsync(`values.${addr}`, {
+                    type: "state",
+                    common: {
+                        name: v.name,
+                        type: "number",
+                        role: "value",
+                        read: true,
+                        write: true
+                    },
+                    native: {
+                        uri: v.uri
+                    }
+                });
 
-            await this.client.put(`/user/vars/${this.config.varset}/${uri}`);
+                const uri = v.uri.replace("/", "");
 
+                await this.client.put(`/user/vars/${this.config.varset}/${uri}`);
+
+            }
+
+        } catch (error) {
+            this.log.error(`Menu Discovery Fehler: ${error}`);
         }
 
     }
 
     async pollVars() {
 
-        const data = await this.client.get(`/user/vars/${this.config.varset}`);
+        try {
 
-        if (!data.eta.vars) return;
+            const data = await this.client.get(`/user/vars/${this.config.varset}`);
 
-        const vars = data.eta.vars[0].variable;
+            if (!data.eta.vars) return;
 
-        for (const v of vars) {
+            const vars = data.eta.vars[0].variable;
 
-            const uri = v.$.uri;
+            for (const v of vars) {
 
-            const id = `values.${uri.replace(/\//g,"_")}`;
+                const uri = v.$.uri;
 
-            const raw = parseFloat(v._);
+                const id = `values.${uri.replace(/\//g, "_")}`;
 
-            const scale = parseFloat(v.$.scaleFactor || 1);
+                const raw = parseFloat(v._);
 
-            const val = raw / scale;
+                const scale = parseFloat(v.$.scaleFactor || 1);
 
-            await this.setStateAsync(id, val, true);
+                const val = raw / scale;
 
+                await this.setStateAsync(id, val, true);
+
+            }
+
+        } catch (error) {
+            this.log.error(`Polling Fehler: ${error}`);
         }
 
     }
 
     async pollErrors() {
 
-        const data = await this.client.get("/user/errors");
+        try {
 
-        await this.setObjectNotExistsAsync("errors.raw", {
-            type: "state",
-            common: {
-                type: "string",
-                role: "json",
-                read: true,
-                write: false
-            },
-            native: {}
-        });
+            const data = await this.client.get("/user/errors");
 
-        await this.setStateAsync("errors.raw", JSON.stringify(data), true);
+            await this.setObjectNotExistsAsync("errors.raw", {
+                type: "state",
+                common: {
+                    name: "Active Errors",
+                    type: "string",
+                    role: "json",
+                    read: true,
+                    write: false
+                },
+                native: {}
+            });
+
+            await this.setStateAsync("errors.raw", JSON.stringify(data), true);
+
+        } catch (error) {
+            this.log.error(`Error Polling Fehler: ${error}`);
+        }
 
     }
 
@@ -122,20 +155,28 @@ class EtaTouch extends utils.Adapter {
 
         if (!state || state.ack) return;
 
-        const obj = await this.getObjectAsync(id);
+        try {
 
-        const uri = obj.native.uri;
+            const obj = await this.getObjectAsync(id);
 
-        const raw = Math.round(state.val);
+            if (!obj || !obj.native || !obj.native.uri) return;
 
-        await this.client.post(`/user/var${uri}`, `value=${raw}`);
+            const uri = obj.native.uri;
+
+            const raw = Math.round(state.val);
+
+            await this.client.post(`/user/var${uri}`, `value=${raw}`);
+
+        } catch (error) {
+            this.log.error(`State Write Fehler: ${error}`);
+        }
 
     }
 
 }
 
 if (require.main !== module) {
-    module.exports = (options) => new EtaTouch(options);
+    module.exports = (options) => new MeinEta(options);
 } else {
-    new EtaTouch();
+    new MeinEta();
 }
