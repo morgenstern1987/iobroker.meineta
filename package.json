@@ -1,1 +1,13 @@
-
+{
+  "name": "iobroker.eta-touch",
+  "version": "0.0.1",
+  "description": "ETA Touch heating adapter",
+  "author": "Henrik Morgenstern",
+  "license": "MIT",
+  "main": "main.js",
+  "dependencies": {
+    "@iobroker/adapter-core": "^3.2.0",
+    "axios": "^1.6.0",
+    "xml2js": "^0.6.2"
+  }
+}
