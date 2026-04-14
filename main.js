@@ -26,8 +26,10 @@ class MeinEta extends utils.Adapter {
         try {
 
             if (!this.config.host) {
-                this.log.error("Keine ETA IP konfiguriert");
+
+                this.log.error("Bitte ETA IP konfigurieren");
                 return;
+
             }
 
             this.client = new EtaClient(this.config.host, this.config.port);
@@ -36,9 +38,14 @@ class MeinEta extends utils.Adapter {
 
             await this.discoverVariables();
 
+            this.subscribeStates("*");
+
+            this.log.info("Discovery abgeschlossen");
+
             setTimeout(() => {
 
                 this.pollVars();
+                this.pollErrors();
 
                 this.pollTimer = setInterval(() => {
 
@@ -51,7 +58,7 @@ class MeinEta extends utils.Adapter {
 
         } catch (error) {
 
-            this.log.error(error);
+            this.log.error(`Startfehler: ${error}`);
 
         }
 
@@ -73,33 +80,43 @@ class MeinEta extends utils.Adapter {
 
     async discoverVariables() {
 
-        const data = await this.client.get("/user/menu");
+        try {
 
-        const menu = data.eta.menu[0];
+            this.log.info("Lese ETA Menüstruktur");
 
-        const variables = extractVariables(menu);
+            const data = await this.client.get("/user/menu");
 
-        this.log.info(`ETA Variablen gefunden: ${variables.length}`);
+            const menu = data.eta.menu[0];
 
-        for (const v of variables) {
+            const variables = extractVariables(menu);
 
-            const id = buildObjectPath(v.path);
+            this.log.info(`Gefundene Variablen: ${variables.length}`);
 
-            this.uriMap[v.uri] = id;
+            for (const v of variables) {
 
-            await this.createObjectTree(id, v.name, v.uri);
+                const id = buildObjectPath(v.path);
 
-            const parts = v.uri.replace(/^\//, "").split("/");
+                this.uriMap[v.uri] = id;
 
-            try {
+                await this.createObjectTree(id, v.name, v.uri);
 
-                await this.client.put(`/user/vars/${this.config.varset}/${parts.join("/")}`);
+                const uri = v.uri.replace(/^\//, "");
 
-            } catch (error) {
+                try {
 
-                this.log.debug(`Var nicht hinzugefügt: ${v.uri}`);
+                    await this.client.put(`/user/vars/${this.config.varset}/${uri}`);
+
+                } catch {
+
+                    this.log.debug(`Var nicht hinzugefügt: ${uri}`);
+
+                }
 
             }
+
+        } catch (error) {
+
+            this.log.error(`Discovery Fehler: ${error}`);
 
         }
 
@@ -129,7 +146,7 @@ class MeinEta extends utils.Adapter {
                         type: "number",
                         role: "value",
                         read: true,
-                        write: false
+                        write: true
                     },
                     native: {
                         uri
@@ -161,15 +178,17 @@ class MeinEta extends utils.Adapter {
             const vars = data?.eta?.vars?.[0]?.variable;
 
             if (!vars) {
+
                 this.log.warn("Keine Variablen vom ETA Server");
                 return;
+
             }
 
             for (const v of vars) {
 
                 const uri = v.$.uri;
 
-                const id = this.uriMap[`/${uri}`];
+                const id = this.uriMap[`/${uri}`] || this.uriMap[uri];
 
                 if (!id) continue;
 
@@ -177,6 +196,18 @@ class MeinEta extends utils.Adapter {
                 const scale = parseFloat(v.$.scaleFactor || 1);
 
                 const value = raw / scale;
+
+                const unit = v.$.unit || "";
+
+                const obj = await this.getObjectAsync(id);
+
+                if (obj && unit && obj.common.unit !== unit) {
+
+                    obj.common.unit = unit;
+
+                    await this.setObjectAsync(id, obj);
+
+                }
 
                 await this.setStateAsync(id, value, true);
 
@@ -210,14 +241,44 @@ class MeinEta extends utils.Adapter {
 
             await this.setStateAsync("errors.raw", JSON.stringify(data), true);
 
-        } catch {}
+        } catch (error) {
+
+            this.log.error(`Error Polling Fehler: ${error}`);
+
+        }
+
+    }
+
+    async onStateChange(id, state) {
+
+        if (!state || state.ack) return;
+
+        try {
+
+            const obj = await this.getObjectAsync(id);
+
+            if (!obj?.native?.uri) return;
+
+            const raw = Math.round(state.val);
+
+            await this.client.post(`/user/var${obj.native.uri}`, `value=${raw}`);
+
+        } catch (error) {
+
+            this.log.error(`Write Fehler: ${error}`);
+
+        }
 
     }
 
 }
 
 if (require.main !== module) {
+
     module.exports = (options) => new MeinEta(options);
+
 } else {
+
     new MeinEta();
+
 }
