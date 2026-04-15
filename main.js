@@ -3,19 +3,24 @@
 const utils = require('@iobroker/adapter-core');
 const http  = require('http');
 
-class EtaTouch extends utils.Adapter {
+// Feste Gruppen: config-Key → exakter fub-Name im ETAtouch-Menübaum
+const FIXED_GROUPS = {
+    groupPuffer: 'PufferFlex',
+    groupKessel: 'Kessel',
+    groupHK:     'HK',
+    groupLager:  'Lager',
+    groupKamin:  'Kamin'
+};
+
+class MeinETA extends utils.Adapter {
 
     constructor(options) {
         super({ ...options, name: 'meineta' });
-        this.pollTimer   = null;
-        this.menuTree    = null;   // raw parsed menu
-        this.groupMap    = {};     // { groupId: { name, vars: [{uri, name}] } }
-        this.on('ready',   this.onReady.bind(this));
-        this.on('unload',  this.onUnload.bind(this));
-        this.on('message', this.onMessage.bind(this));
+        this.pollTimer = null;
+        this.groupMap  = {};
+        this.on('ready',  this.onReady.bind(this));
+        this.on('unload', this.onUnload.bind(this));
     }
-
-    // ─── lifecycle ────────────────────────────────────────────────────────────
 
     async onReady() {
         this.setState('info.connection', false, true);
@@ -24,19 +29,26 @@ class EtaTouch extends utils.Adapter {
         const port = parseInt(this.config.port) || 8080;
 
         if (!ip) {
-            this.log.warn('No IP configured – adapter idle until configured.');
+            this.log.warn('Keine IP konfiguriert – Adapter wartet auf Konfiguration.');
             return;
         }
 
         this.baseUrl = `http://${ip}:${port}`;
-        this.log.info(`ETA Touch adapter started – target: ${this.baseUrl}`);
+        this.log.info(`MeinETA gestartet – Ziel: ${this.baseUrl}`);
+
+        // Welche Gruppen sind aktiviert?
+        this.activeGroups = Object.entries(FIXED_GROUPS)
+            .filter(([key]) => this.config[key] !== false)
+            .map(([, name]) => name);
+
+        this.log.info(`Aktive Gruppen: ${this.activeGroups.join(', ')}`);
 
         try {
             await this.fetchAndParseMenu();
-            await this.pollSelectedGroups();
+            await this.pollAll();
             this.scheduleNextPoll();
         } catch (e) {
-            this.log.error(`Startup error: ${e.message}`);
+            this.log.error(`Startfehler: ${e.message}`);
         }
     }
 
@@ -45,127 +57,67 @@ class EtaTouch extends utils.Adapter {
         callback();
     }
 
-    // ─── message handler (used by admin UI) ───────────────────────────────────
-
-    onMessage(obj) {
-        if (!obj || !obj.command) return;
-
-        switch (obj.command) {
-            case 'getGroups':
-                // Admin requests the list of groups so the user can select them
-                this.fetchAndParseMenu()
-                    .then(() => {
-                        const groups = Object.entries(this.groupMap).map(([id, g]) => ({
-                            value: id,
-                            label: g.name
-                        }));
-                        this.sendTo(obj.from, obj.command, { groups }, obj.callback);
-                    })
-                    .catch(e => {
-                        this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
-                    });
-                break;
-
-            default:
-                break;
-        }
-    }
-
-    // ─── HTTP helper ──────────────────────────────────────────────────────────
+    // ── HTTP ──────────────────────────────────────────────────────────────────
 
     httpGet(path) {
         return new Promise((resolve, reject) => {
             const url = `${this.baseUrl}${path}`;
-            http.get(url, { timeout: 10000 }, (res) => {
+            const req = http.get(url, { timeout: 10000 }, (res) => {
                 let data = '';
-                res.on('data', chunk => (data += chunk));
+                res.on('data', c => (data += c));
                 res.on('end', () => {
                     if (res.statusCode !== 200) {
-                        reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+                        reject(new Error(`HTTP ${res.statusCode} – ${url}`));
                     } else {
                         resolve(data);
                     }
                 });
-            }).on('error', reject)
-              .on('timeout', () => reject(new Error(`Timeout for ${url}`)));
+            });
+            req.on('error',   reject);
+            req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout – ${url}`)); });
         });
     }
 
-    // ─── XML helpers (no external dependency) ─────────────────────────────────
+    // ── XML-Parser (ohne externe Abhängigkeit) ────────────────────────────────
 
-    /**
-     * Minimal XML attribute extractor.
-     * Returns { attrName: value, ... } for a single XML tag string.
-     */
     parseAttributes(tagStr) {
         const attrs = {};
         const re = /(\w+)="([^"]*)"/g;
         let m;
-        while ((m = re.exec(tagStr)) !== null) {
-            attrs[m[1]] = m[2];
-        }
+        while ((m = re.exec(tagStr)) !== null) attrs[m[1]] = m[2];
         return attrs;
     }
 
-    /**
-     * Parse the ETA menu XML into a flat group map.
-     * Groups are the top-level <fub> elements; within each fub we collect
-     * all leaf <object> URIs recursively.
-     */
     parseMenuXml(xml) {
         const groupMap = {};
-
-        // Find all fub blocks
         const fubRe = /<fub([^>]*)>([\s\S]*?)<\/fub>/g;
         let fubMatch;
         while ((fubMatch = fubRe.exec(xml)) !== null) {
-            const fubAttrs = this.parseAttributes(fubMatch[1]);
-            const fubUri   = fubAttrs.uri  || '';
-            const fubName  = fubAttrs.name || fubUri;
-
-            // derive a stable group id from uri (replace / with _)
-            const groupId = fubUri.replace(/\//g, '_').replace(/^_/, '');
-
-            const vars = [];
-            this.collectLeafObjects(fubMatch[2], vars);
-
-            groupMap[groupId] = {
-                name: fubName,
-                fubUri,
-                vars
-            };
+            const attrs   = this.parseAttributes(fubMatch[1]);
+            const fubName = attrs.name || attrs.uri || '';
+            const fubUri  = attrs.uri  || '';
+            const vars    = [];
+            this.collectLeaves(fubMatch[2], vars);
+            groupMap[fubName] = { name: fubName, fubUri, vars };
         }
-
         return groupMap;
     }
 
-    /**
-     * Recursively collect leaf <object> elements (those that have no children
-     * or whose children have no further objects).
-     */
-    collectLeafObjects(xmlChunk, result) {
-        // Match every <object …/> or <object …> … </object>
-        const objRe = /<object([^>]*?)(\/>|>([\s\S]*?)<\/object>)/g;
+    collectLeaves(chunk, result) {
+        const re = /<object([^>]*?)(\/>|>([\s\S]*?)<\/object>)/g;
         let m;
-        while ((m = objRe.exec(xmlChunk)) !== null) {
+        while ((m = re.exec(chunk)) !== null) {
             const attrs    = this.parseAttributes(m[1]);
-            const uri      = attrs.uri  || '';
-            const name     = attrs.name || uri;
             const inner    = m[3] || '';
             const hasChild = /<object/.test(inner);
-
-            if (!hasChild && uri) {
-                result.push({ uri, name });
+            if (!hasChild && attrs.uri) {
+                result.push({ uri: attrs.uri, name: attrs.name || attrs.uri });
             } else if (inner) {
-                // recurse
-                this.collectLeafObjects(inner, result);
+                this.collectLeaves(inner, result);
             }
         }
     }
 
-    /**
-     * Parse a single <value …> response.
-     */
     parseVarXml(xml) {
         const m = /<value([^>]*)>([\s\S]*?)<\/value>/.exec(xml);
         if (!m) return null;
@@ -174,54 +126,46 @@ class EtaTouch extends utils.Adapter {
         return attrs;
     }
 
-    // ─── menu fetch ───────────────────────────────────────────────────────────
+    // ── Menübaum abrufen ──────────────────────────────────────────────────────
 
     async fetchAndParseMenu() {
-        const xml      = await this.httpGet('/user/menu');
-        this.groupMap  = this.parseMenuXml(xml);
+        const xml     = await this.httpGet('/user/menu');
+        this.groupMap = this.parseMenuXml(xml);
         this.setState('info.connection', true, true);
-        this.log.debug(`Menu parsed – ${Object.keys(this.groupMap).length} groups found.`);
+        const names = Object.keys(this.groupMap);
+        this.log.debug(`Menü geparst – ${names.length} fubs: ${names.join(', ')}`);
     }
 
-    // ─── polling ──────────────────────────────────────────────────────────────
+    // ── Polling ───────────────────────────────────────────────────────────────
 
-    async pollSelectedGroups() {
-        const selected = this.config.selectedGroups || [];
-        if (!selected.length) {
-            this.log.info('No groups selected – nothing to poll.');
-            return;
-        }
-
-        for (const groupId of selected) {
-            const group = this.groupMap[groupId];
+    async pollAll() {
+        for (const groupName of this.activeGroups) {
+            const group = this.groupMap[groupName];
             if (!group) {
-                this.log.warn(`Group "${groupId}" not found in menu tree – skipped.`);
+                this.log.warn(`Gruppe "${groupName}" nicht im Menübaum gefunden – übersprungen.`);
                 continue;
             }
-            await this.pollGroup(groupId, group);
+            await this.pollGroup(group);
         }
     }
 
-    async pollGroup(groupId, group) {
-        const safeGroupName = this.sanitizeId(group.name);
+    async pollGroup(group) {
+        const safeGroup = this.sanitize(group.name);
+        let ok = 0, fail = 0;
 
         for (const v of group.vars) {
             try {
-                const xml   = await this.httpGet(`/user/var${v.uri}`);
-                const data  = this.parseVarXml(xml);
+                const xml  = await this.httpGet(`/user/var${v.uri}`);
+                const data = this.parseVarXml(xml);
                 if (!data) continue;
 
-                // Build ioBroker object path:  eta-touch.0.<groupName>.<varName>
-                const safeVarName = this.sanitizeId(v.name);
-                const objId       = `${safeGroupName}.${safeVarName}`;
-
-                // Determine numeric value
                 const scaleFactor = parseFloat(data.scaleFactor) || 1;
                 const decPlaces   = parseInt(data.decPlaces)     || 0;
                 const rawNum      = parseFloat(data.rawValue);
                 const numValue    = isNaN(rawNum) ? null : rawNum / scaleFactor;
 
-                // Create/update object definition
+                const objId = `${safeGroup}.${this.sanitize(v.name)}`;
+
                 await this.setObjectNotExistsAsync(objId, {
                     type: 'state',
                     common: {
@@ -240,58 +184,46 @@ class EtaTouch extends utils.Adapter {
                     }
                 });
 
-                // Write state
-                const stateValue = numValue !== null
+                const val = numValue !== null
                     ? parseFloat(numValue.toFixed(decPlaces))
-                    : data.strValue || data.rawValue;
+                    : (data.strValue || data.rawValue);
 
-                await this.setStateAsync(objId, { val: stateValue, ack: true });
-
+                await this.setStateAsync(objId, { val, ack: true });
+                ok++;
             } catch (e) {
-                this.log.warn(`Failed to read ${v.uri}: ${e.message}`);
+                this.log.warn(`Fehler bei ${v.uri}: ${e.message}`);
+                fail++;
             }
         }
-        this.log.debug(`Polled group "${group.name}" (${group.vars.length} vars).`);
+        this.log.debug(`Gruppe "${group.name}": ${ok} OK, ${fail} Fehler`);
     }
 
     scheduleNextPoll() {
-        const interval = (parseInt(this.config.pollInterval) || 60) * 1000;
+        const ms = (parseInt(this.config.pollInterval) || 60) * 1000;
         this.pollTimer = setTimeout(async () => {
             try {
-                if (!this.groupMap || !Object.keys(this.groupMap).length) {
-                    await this.fetchAndParseMenu();
-                }
-                await this.pollSelectedGroups();
+                await this.pollAll();
             } catch (e) {
-                this.log.error(`Poll error: ${e.message}`);
+                this.log.error(`Poll-Fehler: ${e.message}`);
                 this.setState('info.connection', false, true);
             }
             this.scheduleNextPoll();
-        }, interval);
+        }, ms);
     }
 
-    // ─── helpers ──────────────────────────────────────────────────────────────
+    // ── Hilfsfunktionen ───────────────────────────────────────────────────────
 
-    /**
-     * Make a string safe for use as an ioBroker object ID.
-     * Replaces everything that is not a-z, A-Z, 0-9, dot, dash, or underscore.
-     */
-    sanitizeId(str) {
+    sanitize(str) {
         return str
-            .replace(/[äÄ]/g, 'ae')
-            .replace(/[öÖ]/g, 'oe')
-            .replace(/[üÜ]/g, 'ue')
-            .replace(/ß/g, 'ss')
-            .replace(/[^a-zA-Z0-9_\-\.]/g, '_')
-            .replace(/__+/g, '_')
-            .replace(/^_|_$/g, '');
+            .replace(/[äÄ]/g, 'ae').replace(/[öÖ]/g, 'oe')
+            .replace(/[üÜ]/g, 'ue').replace(/ß/g, 'ss')
+            .replace(/[^a-zA-Z0-9_\-.]/g, '_')
+            .replace(/__+/g, '_').replace(/^_|_$/g, '');
     }
 }
 
-// ─── entry point ──────────────────────────────────────────────────────────────
-
 if (require.main !== module) {
-    module.exports = (options) => new EtaTouch(options);
+    module.exports = (options) => new MeinETA(options);
 } else {
-    new EtaTouch();
+    new MeinETA();
 }
