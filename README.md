@@ -2,12 +2,6 @@
 
 ![Logo](admin/eta-logo.png)
 
-[![NPM version](https://img.shields.io/npm/v/iobroker.meineta.svg)](https://www.npmjs.com/package/iobroker.meineta)
-[![Downloads](https://img.shields.io/npm/dm/iobroker.meineta.svg)](https://www.npmjs.com/package/iobroker.meineta)
-[![License](https://img.shields.io/github/license/morgenstern1987/iobroker.meineta)](LICENSE)
-[![GitHub issues](https://img.shields.io/github/issues/morgenstern1987/iobroker.meineta)](https://github.com/morgenstern1987/iobroker.meineta/issues)
-[![GitHub last commit](https://img.shields.io/github/last-commit/morgenstern1987/iobroker.meineta)](https://github.com/morgenstern1987/iobroker.meineta/commits/main)
-
 Liest Werte von **ETA Touch Pelletheizungen** über die offizielle RESTful API aus und stellt sie als ioBroker-Datenpunkte bereit.
 
 ---
