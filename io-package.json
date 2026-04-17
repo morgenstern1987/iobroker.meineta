@@ -115,5 +115,10 @@
     "groupKamin": true
   },
   "objects": [],
-  "instanceObjects": []
+  "instanceObjects": [],
+  "globalDependencies": [
+    {
+      "admin": ">=6.0.0"
+    }
+  ]
 }
